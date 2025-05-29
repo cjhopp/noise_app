@@ -5,10 +5,10 @@ import dask
 import dask.array as da
 
 from tqdm import tqdm
-from datetime import datetime
+from datetime import timedelta
 from obspy import read, UTCDateTime
 from obspy.core.inventory import Inventory
-from scipy.signal import get_window, butter, sosfiltfilt
+from scipy.signal import get_window, butter, sosfiltfilt, resample_poly
 import matplotlib.pyplot as plt
 import logging
 
@@ -74,28 +74,81 @@ class SeismicBeamformer:
             data = np.pad(data, (0, npts - data.size), mode="constant")
         return data
 
+    @staticmethod
+    def _read_and_resamp_many(fns: list,
+                              t0: UTCDateTime,
+                              t1: UTCDateTime,
+                              samp_rate: float,
+                              station: str,
+                              comp: str,
+                              npts: int) -> np.ndarray:
+        """
+        ORIGINAL version: read *all* MiniSEED files for one station-comp,
+        merge them into a single 24-h Trace, resample, then pad/crop to
+        exactly `npts`.  Fast, but uses a lot of RAM while running.
+        """
+        from obspy import Stream
+
+        st = Stream()
+        for fn in fns:
+            try:
+                st += read(fn)
+            except Exception:
+                continue
+
+        # keep only the requested station & component
+        st = st.select(station=station, channel=f"*{comp}")
+        for tr in st:
+            tr.data = tr.data.astype(np.float32)
+
+        if len(st) == 0:
+            return np.zeros(npts, dtype=np.float32)
+
+        # merge gaps with zeros → one 24-h trace
+        st.merge(method=0, fill_value=0.0)
+        tr = st[0]
+        tr.data = tr.data.astype(np.float32)
+
+        # trim exactly to [t0, t1]
+        tr.trim(t0, t1, pad=True, fill_value=0.0)
+
+        # down-sample if requested
+        if samp_rate is not None:
+            tr.resample(samp_rate)
+
+        data = tr.data.astype(np.float32)
+
+        # force exact length
+        if data.size > npts:
+            data = data[:npts]
+        elif data.size < npts:
+            data = np.pad(data, (0, npts - data.size), mode="constant")
+
+        return data
+    
     def load_data(self,
-                  date_fmt: str = "%Y.%j.%H.%M.%S.%f",
-                  raw_zarr: str = None) -> xr.Dataset:
+                  date_fmt: str = "%Y.%j.%H.%M.%S.%f") -> xr.Dataset:
         """
         1) reads & trims all MSEED files in [t0,t1]
         2) resamples to self.samp_rate
         3) stacks into an xarray.Dataset with dims (tr, time)
         4) converts station lat/lon → UTM
-        5) optionally writes the raw timeseries to Zarr
         """
         logging.info("Discovering files…")
-        all_files = glob.glob(os.path.join(self.mseed_dir, "**/*"),
-                              recursive=True)
-        all_files = [f for f in all_files if os.path.isfile(f)]
-
-        # parse dates from filenames (hard-coded convention)
-        basenames = [os.path.basename(f)[:-8] for f in all_files]
-        dates = np.array([datetime.strptime(fn, date_fmt)
-                          for fn in basenames])
-        mask = (self.t0.datetime <= dates) & (dates <= self.t1.datetime)
-        files = np.array(all_files)[mask]
-
+        # NEW: only glob the julian‐day patterns that overlap [t0,t1)
+        files = []
+        day = self.t0.datetime.date()
+        end_day = self.t1.datetime.date()
+        while day <= end_day:
+            y = day.year
+            jday = day.timetuple().tm_yday
+            pat = os.path.join(self.mseed_dir,
+                               f"{y}.{jday:03d}",
+                               "*")
+            files.extend(glob.glob(pat, recursive=True))
+            day += timedelta(days=1)
+        # de‐dupe + keep only real files
+        files = sorted({f for f in files if os.path.isfile(f)})
         # list of stations & comps from Inventory
         stations = sorted({sta.code
                            for net in self.inv
@@ -104,9 +157,11 @@ class SeismicBeamformer:
 
         # determine sampling & number of points
         hdr = read(files[0], headonly=True)[0]
-        fs0 = 1.0 / hdr.stats.delta
-        total_s = float(self.t1 - self.t0)
-        npts = int(np.round(total_s * fs0))
+        total_s = float(self.t1 - self.t0)           # 86 400 for one day
+
+        fs_raw  = 1.0 / hdr.stats.delta              # whatever is in MiniSEED
+        fs_use  = self.samp_rate if self.samp_rate is not None else fs_raw
+        npts    = int(round(total_s * fs_use))       # 86 400 × 20 = 1 728 000
         self.npts = npts
         self.dt   = 1.0 / self.samp_rate
 
@@ -114,45 +169,53 @@ class SeismicBeamformer:
         from collections import defaultdict
         filemap = defaultdict(list)
         for fn in files:
-            stmp = read(fn, headonly=True)
-            for tr in stmp:
-                sta = tr.stats.station
-                comp_ = tr.stats.channel[-1]
-                if sta in stations and comp_ in comps:
-                    filemap[(sta,comp_)].append(fn)
-
+            base  = os.path.basename(fn)
+            parts = base.split(".")
+            sta   = parts[-2]
+            comp_ = parts[-1][-1]   # "Z" or "N" or "E"
+            if sta in stations and comp_ in comps:
+                filemap[(sta,comp_)].append(fn)
         # build one dask array per trace (sta‐comp)
         logging.info("Building dask arrays for each trace…")
+        full_chunk = (npts,)                                # one chunk
+
         darr_list, tr_names = [], []
-        chunks = int(self.chunk_size_s * self.samp_rate)
+
         for sta in stations:
             for comp_ in comps:
                 key = (sta, comp_)
                 fns = sorted(filemap.get(key, []))
+
                 if not fns:
+                    # ---- missing channel: all-zero trace, one chunk ----------
                     darr = da.zeros((npts,),
-                                    chunks=(chunks,),
+                                    chunks=full_chunk,       # <<< one chunk
                                     dtype=np.float32)
                 else:
-                    pieces = []
-                    for fn in fns:
-                        blk = dask.delayed(self._read_and_resamp)(
-                            fn, self.t0, self.t1,
-                            self.samp_rate, sta, comp_, npts
+                    # ---- real channel ----------------------------------------
+                    blk  = dask.delayed(self._read_and_resamp_many)(
+                                fns, self.t0, self.t1,
+                                self.samp_rate, sta, comp_, npts
                         )
-                        darr_blk = da.from_delayed(blk,
-                                                   shape=(npts,),
-                                                   dtype=np.float32)
-                        darr_blk = darr_blk.rechunk((chunks,))
-                        pieces.append(darr_blk)
-                    darr = da.concatenate(pieces, axis=0)[:npts]
+                    darr = da.from_delayed(blk,
+                                        shape=(npts,),
+                                        dtype=np.float32)
+                    darr = darr.rechunk(full_chunk)          # <<< one chunk
+
                 darr_list.append(darr)
                 tr_names.append(f"{sta}-{comp_}")
 
-        # stack into (ntr, nt)
-        data = da.stack(darr_list, axis=0)
-        time = np.arange(npts) * self.dt
+        # stack and keep one-trace-per-chunk layout
+        data = da.stack(darr_list, axis=0)                   # (ntr, nt)
+        data = data.rechunk((1, npts))  
 
+        # -------------   NEW:  make the final chunking *right here*   ‑----------
+        # chunks_t = int(self.chunk_size_s * self.samp_rate)   # 1200 s  → 24 000 samples
+        # one trace per chunk, desired time-chunk along axis-1
+        # data = data.rechunk((1, chunks_t))
+        # ----------------------------------------------------------------------
+
+        time = np.arange(npts) * self.dt
         ds = xr.Dataset(
             {"u": (("tr","time"), data)},
             coords={
@@ -182,15 +245,6 @@ class SeismicBeamformer:
             if not found:
                 raise ValueError(f"Station {sta_code} not in inventory")
         self.coords = np.array(utm_pts)
-
-        # optionally spill raw to Zarr
-        if raw_zarr:
-            logging.info(f"Writing raw timeseries to {raw_zarr}")
-            ds.u.to_dataset(name="u") \
-                 .to_zarr(raw_zarr,
-                          mode="w",
-                          consolidated=True)
-            self.raw_zarr = raw_zarr
 
         return ds
 

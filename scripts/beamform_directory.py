@@ -1,176 +1,286 @@
 #!/usr/bin/env python3
-"""
-Full‐range beamforming from RUN_START → RUN_END
-using Dask LocalCluster (4 workers × 2 threads each).
-
-Dependencies:
-  pip install numpy xarray dask[distributed] obspy scipy matplotlib
-"""
-
 import os
-# throttle BLAS in each worker
-os.environ["OMP_NUM_THREADS"]       = "2"
-os.environ["OPENBLAS_NUM_THREADS"]  = "2"
-os.environ["MKL_NUM_THREADS"]       = "2"
-
+import gc
+import json
+import utm
 import numpy as np
 import xarray as xr
+import dask
+
 from obspy import UTCDateTime, read_inventory
 from dask.distributed import Client, LocalCluster
 
-# -------------------------------------------------------------------
-# USER PARAMETERS: edit these
-# -------------------------------------------------------------------
-# 1) time window for the entire run:
-RUN_START    = "2022-02-15T06:00:00"
-RUN_END      = "2023-01-07T18:30:00"
+from seismic_beamformer import SeismicBeamformer
 
-# 2) paths & inventory
-MSEED_DIR     = "/path/to/your/mseed"
-INVENTORY_XML = "/path/to/your/inventory.xml"
-OUTDIR        = "/path/to/output_dir"
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# USER PARAMETERS — edit these
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+RUN_START    = "2023-12-09T00:00:00"
+RUN_END      = "2024-10-08T00:00:00"
 
-# 3) beam‐forming “cheap” knobs
-SAMP_RATE   = 20.0       # Hz, Nyquist > highest band
-CHUNK_S     = 600.0      # data‐chunk size for dask arrays
-WIN_S       = 300.0      # window length [s]
-OVERLAP     = 0.2        # 20% overlap
-PAD_S       = 10.0       # padding for filtfilt
-METHOD      = "bartlett" # only Bartlett here
+MSEED_DIR     = "/media/chopp/Data1/chet-ingeneous/Gabbs_MSEED/"
+INVENTORY_XML = "/media/chopp/Data1/chet-ingeneous/stations/Gabbs_Inventory.xml"
+OUTDIR        = "/media/chopp/Data1/chet-ingeneous/Gabbs_Beamforming/"
 
-# 4) coarse beam grid
-BAZS  = np.arange(0, 360, 5.0)        # every 5°
-SLOWS = np.linspace(0.0, 0.003, 30)   # 0 → 3 ms/m in 30 steps
+SAMP_RATE   = 20.0      # Hz
+CHUNK_S     = 1200.0    # for filter/CSD chunk‐size
+WIN_S       = 50.0      # window length for CSD
+OVERLAP     = 0.2
+PAD_S       = 10.0
 
-# 5) frequency bands
-BANDS = [
-    (0.1, 1.0),
-    (1.0, 5.0),
-    (5.0,10.0),
-]
+BAZS  = np.arange(0,360,5.0)
+SLOWS = np.linspace(0.0,0.003,30)
+BANDS = [(0.1,1.0),(1.0,5.0),(5.0,10.0)]
 
-# -------------------------------------------------------------------
-# import your beam‐former class
-# -------------------------------------------------------------------
-from yourmodule import SeismicBeamformer
-# -------------------------------------------------------------------
+# how large to make each raw‐Zarr time chunk?
+WRITE_CHUNK_S = 86400                  # 10 minutes
+WRITE_CHUNK_N = int(WRITE_CHUNK_S * SAMP_RATE)
 
-def process_block(inv, mseed_dir, t0_str, t1_str, outdir):
+# ─── add somewhere near the top of the driver script ───────────────────
+
+def raw_store_complete(path: str,
+                       expected_ntr:  int,
+                       expected_npts: int) -> bool:
     """
-    1) load_data → raw_zarr
-    2) preprocess & compute_csd_dask → csd_zarr
-    3) compute_beams per‐band → small beam_zarrs
+    True  -> folder exists and variable 'u' has
+               shape   (expected_ntr,  expected_npts)  AND
+               chunks  (all 1,        entire npts)
+    False -> any other situation (missing folder, wrong size, etc.)
     """
-    t0 = UTCDateTime(t0_str)
-    t1 = UTCDateTime(t1_str)
+    if not os.path.isdir(path):
+        return False
 
-    tag = f"{t0.year}_{t0.julday:03d}"
-    raw_zarr = os.path.join(outdir, f"raw_{tag}.zarr")
-    csd_zarr = os.path.join(outdir, f"csd_{tag}.zarr")
+    try:
+        ds = xr.open_zarr(path, consolidated=True)
+    except Exception:
+        return False          # not a valid consolidated store
 
-    # -- 1) load & resample
-    bf = SeismicBeamformer(
-        mseed_dir=mseed_dir,
-        inventory=inv,
-        t0=t0, t1=t1,
-        samp_rate=SAMP_RATE,
-        chunk_size_s=CHUNK_S
-    )
-    bf.load_data(raw_zarr=raw_zarr)
-    bf.preprocess(
-        band=(0.1, 10.0),
-        window_s=WIN_S,
-        overlap=OVERLAP,
-        pad_s=PAD_S
-    )
+    if "u" not in ds:
+        return False
 
-    # -- 2) compute full‐band CSD to disk
-    bf.compute_csd_dask(spill_zarr=csd_zarr)
+    # ---- shape ---------------------------------------------------------
+    if tuple(ds.u.shape) != (expected_ntr, expected_npts):
+        return False
 
-    # -- 3) beam‐scan each band
-    for fmin, fmax in BANDS:
-        bf.compute_beams(
-            bazs=BAZS,
-            slows=SLOWS,
-            method=METHOD,
-            freq_band=(fmin, fmax)
-        )
-        # wrap P_fb in xarray and write
-        dsb = xr.DataArray(
-            bf.P_fb,
-            dims=("freq","beam"),
-            coords={
-                "freq": bf.freqs_sel,
-                "beam": np.arange(bf.nbaz * bf.nslow)
-            }
-        ).to_dataset(name="P_fb")
-        out_beam = os.path.join(
-            outdir,
-            f"beam_{fmin:.2f}-{fmax:.2f}_{tag}.zarr"
-        )
-        dsb.to_zarr(out_beam, mode="w", consolidated=True)
+    # ---- chunking along 'tr' ------------------------------------------
+    tr_chunks, t_chunks = ds.u.chunks
+    if any(c != 1 for c in tr_chunks):
+        return False
+    if sum(tr_chunks) != expected_ntr:
+        return False
 
-    return f"[{t0_str} → {t1_str}] done"
+    # ---- chunking along 'time' ----------------------------------------
+    if sum(t_chunks) != expected_npts:
+        return False
 
-def make_monthly_blocks(start_iso, end_iso):
-    """
-    Slice [start, end) into calendar‐month chunks.
-    Partial first/last blocks allowed.
-    Returns list of (t0_iso, t1_iso).
-    """
-    start = UTCDateTime(start_iso)
-    end   = UTCDateTime(end_iso)
+    return True
+
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# helper: split into daily (or partial) blocks
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+def make_daily_blocks(start_iso, end_iso):
+    t0 = UTCDateTime(start_iso)
+    t1 = UTCDateTime(end_iso)
     blocks = []
-    cur = start
-    while cur < end:
-        # compute next‐month boundary
-        year = cur.year
-        month = cur.month
-        if month == 12:
-            nxt = UTCDateTime(f"{year+1}-01-01T00:00:00")
-        else:
-            nxt = UTCDateTime(f"{year}-{month+1:02d}-01T00:00:00")
-        t1 = nxt if nxt < end else end
-        blocks.append((cur.isoformat(), t1.isoformat()))
-        cur = t1
+    cur = t0
+    while cur < t1:
+        nxt = cur + 86400
+        end = nxt if nxt < t1 else t1
+        blocks.append((cur, end))
+        cur = end
     return blocks
 
-def main():
-    # load inventory once
-    inv = read_inventory(INVENTORY_XML)
 
-    # build month‐by‐month blocks between RUN_START→RUN_END
-    blocks = make_monthly_blocks(RUN_START, RUN_END)
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# Ask Dask to start spilling way before a hard OOM
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+dask.config.set({
+  "distributed.worker.memory.target":    0.6,
+  "distributed.worker.memory.spill":     0.7,
+  "distributed.worker.memory.pause":     0.8,
+  "distributed.worker.memory.terminate":0.95,
+})
 
-    os.makedirs(OUTDIR, exist_ok=True)
 
-    # start Dask cluster: 4 workers × 2 threads → 8 total threads
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# STAGE 1: read MiniSEED → raw Zarr (one block per day)
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+def stage1_write_raw(inv, blocks):
+    stations      = {sta.code for net in inv for sta in net}
+    expected_ntr  = len(stations) * 3            # 50×3 = 150
+    expected_npts = int(86400 * SAMP_RATE)       # 1 728 000
+
     cluster = LocalCluster(
-        n_workers=4,
-        threads_per_worker=2,
-        memory_limit="12GB",
-        dashboard_address=":8787"
+        n_workers=6,
+        threads_per_worker=1,
+        memory_limit="9GB",
+        resources={"raw-io": 1}
     )
     client = Client(cluster)
-    print("Dask dashboard at", client.dashboard_link)
-    print("Processing blocks:")
-    for b in blocks:
-        print(" ", b[0], "→", b[1])
 
-    # submit jobs
-    futures = [
-        client.submit(process_block,
-                      inv, MSEED_DIR,
-                      t0s, t1s, OUTDIR)
-        for t0s, t1s in blocks
-    ]
+    for t0, t1 in blocks:
+        tag   = f"{t0.year}_{t0.julday:03d}"
+        raw_z = os.path.join(OUTDIR, f"raw_{tag}.zarr")
 
-    # wait & report
-    for res in client.gather(futures):
-        print(res)
+        # skip if everything already present
+        if raw_store_complete(raw_z, expected_ntr, expected_npts):
+            print(f"✓  {raw_z} already complete – skipping")
+            continue
+
+        print(f"Writing {raw_z} …")
+        bf = SeismicBeamformer(
+                 mseed_dir=MSEED_DIR, inventory=inv,
+                 t0=t0, t1=t1,
+                 samp_rate=SAMP_RATE,
+                 chunk_size_s=CHUNK_S
+             )
+        ds  = bf.load_data()
+        ds2 = ds.chunk({"tr": 1, "time": expected_npts})
+
+        write = ds2.to_zarr(raw_z,
+                            mode="w",
+                            consolidated=True,
+                            compute=False,
+                            encoding={"u": {"compressor": None}})
+        client.compute(write).result()
+
+        del bf, ds, ds2
+        gc.collect()
 
     client.close()
     cluster.close()
+
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# STAGE 2: open raw Zarr → preprocess → CSD → csd Zarr
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+def stage2_compute_csd(inv, blocks):
+    cluster = LocalCluster(
+        n_workers=5,
+        threads_per_worker=1,
+        memory_limit="12GB",
+        resources={"csd": 1}
+    )
+    client = Client(cluster)
+
+    for (t0, t1) in blocks:
+        tag   = f"{t0.year}_{t0.julday:03d}"
+        raw_z = os.path.join(OUTDIR, f"raw_{tag}.zarr")
+        csd_z = os.path.join(OUTDIR, f"csd_{tag}.zarr")
+
+        # instantiate beamformer and point it at raw Zarr
+        bf = SeismicBeamformer(
+            mseed_dir=None,
+            inventory=inv,
+            t0=t0, t1=t1,
+            samp_rate=SAMP_RATE,
+            chunk_size_s=CHUNK_S
+        )
+        bf.raw_zarr = raw_z
+
+        # open + rechunk one station at a time
+        ds_raw    = xr.open_zarr(raw_z, consolidated=True)
+        bf.ds     = ds_raw.chunk({"tr": 1, "time": WRITE_CHUNK_N})
+
+        bf.preprocess(
+            band=(0.1,10.0),
+            window_s=WIN_S,
+            overlap=OVERLAP,
+            pad_s=PAD_S
+        )
+
+        # driver‐side CSD Zarr spill
+        bf.compute_csd_dask(spill_zarr=csd_z)
+
+        del bf, ds_raw
+        gc.collect()
+
+    client.close()
+    cluster.close()
+
+
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# STAGE 3: open CSD → beamforming → beam Zarr per band/day
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+def stage3_beam(inv, blocks):
+    cluster = LocalCluster(
+        n_workers=5,
+        threads_per_worker=1,
+        memory_limit="12GB"
+    )
+    client = Client(cluster)
+
+    for (t0, t1) in blocks:
+        tag   = f"{t0.year}_{t0.julday:03d}"
+        csd_z = os.path.join(OUTDIR, f"csd_{tag}.zarr")
+
+        ds_c   = xr.open_zarr(csd_z, consolidated=True)
+        Rf     = ds_c.Rf.data
+        freqs  = ds_c.freq.values
+        trlist = ds_c.tr.values.tolist()    # e.g. ["STA1-Z","STA1-N",...]
+
+        # recompute UTM coords for each trace from Inventory
+        coords = []
+        for nm in trlist:
+            sta = nm.split("-")[0]
+            for net in inv:
+                for st in net:
+                    if st.code == sta:
+                        e,n,_,_ = utm.from_latlon(st.latitude,
+                                                  st.longitude)
+                        coords.append((e,n))
+                        break
+                else:
+                    continue
+                break
+        coords = np.array(coords)
+
+        for (fmin,fmax) in BANDS:
+            bz = os.path.join(
+                OUTDIR,
+                f"beam_{fmin:.2f}-{fmax:.2f}_{tag}.zarr"
+            )
+
+            # lightweight beam‐scan
+            bf = SeismicBeamformer.__new__(SeismicBeamformer)
+            bf.Rf     = Rf
+            bf.freqs  = freqs
+            bf.coords = coords
+            bf.t0, bf.t1 = t0, t1
+
+            bf.compute_beams(
+                bazs=BAZS,
+                slows=SLOWS,
+                method="bartlett",
+                freq_band=(fmin,fmax)
+            )
+
+            da = xr.DataArray(
+                bf.P_fb,
+                dims=("freq","beam"),
+                coords={"freq":bf.freqs_sel,
+                        "beam":np.arange(bf.nbaz*bf.nslow)},
+            )
+            dsb = da.to_dataset(name="P_fb")
+            dsb.to_zarr(bz, mode="w", consolidated=True)
+
+            del bf, dsb
+            gc.collect()
+
+    client.close()
+    cluster.close()
+
+
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+# ENTRY POINT
+#––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+def main():
+    os.makedirs(OUTDIR, exist_ok=True)
+    inv    = read_inventory(INVENTORY_XML).select(station="G*")
+    blocks = make_daily_blocks(RUN_START, RUN_END)
+
+    stage1_write_raw(inv,    blocks)
+    stage2_compute_csd(inv, blocks)
+    stage3_beam(inv,        blocks)
 
 if __name__ == "__main__":
     main()
