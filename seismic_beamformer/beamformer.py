@@ -1,18 +1,36 @@
-import os, glob, utm
+import os, glob, utm, operator
+import logging
+
 import numpy as np
 import xarray as xr
 import dask
 import dask.array as da
+import matplotlib.pyplot as plt
 
 from tqdm import tqdm
+from itertools import zip_longest
 from datetime import timedelta
 from obspy import read, UTCDateTime
 from obspy.core.inventory import Inventory
 from scipy.signal import get_window, butter, sosfiltfilt, resample_poly
-import matplotlib.pyplot as plt
-import logging
-
 logging.basicConfig(level=logging.INFO)
+
+
+
+def tree_add(arrays):
+    """
+    Pair-wise summation until a single Dask array is left.
+    Depth  = ceil(log2(N))  → no recursion-limit issues.
+    """
+    arrays = list(arrays)
+    while len(arrays) > 1:
+        # zip_longest lets us deal with an odd number of items
+        arrays = [
+            a if b is None else operator.add(a, b)
+            for a, b in zip_longest(arrays[::2], arrays[1::2])
+        ]
+    return arrays[0]
+
 
 class SeismicBeamformer:
     def __init__(self,
@@ -21,7 +39,9 @@ class SeismicBeamformer:
                  t0: UTCDateTime,
                  t1: UTCDateTime,
                  samp_rate: float = 50.0,
-                 chunk_size_s: float = 100.0):
+                 chunk_size_s: float = 100.0,
+                 chunks_tr: int = 1.,
+                 chunks_t: int = None):
         """
         mseed_dir    : directory with MiniSEED files
         inventory    : ObsPy Inventory (with lat/lon for each station)
@@ -34,6 +54,8 @@ class SeismicBeamformer:
         self.t0, self.t1  = t0, t1
         self.samp_rate    = samp_rate
         self.chunk_size_s = chunk_size_s
+        self.chunks_tr    = chunks_tr
+        self.chunks_t     = chunks_t
 
         # Will be filled later
         self.ds        = None      # xarray.Dataset of raw timeseries
@@ -206,8 +228,10 @@ class SeismicBeamformer:
                 tr_names.append(f"{sta}-{comp_}")
 
         # stack and keep one-trace-per-chunk layout
-        data = da.stack(darr_list, axis=0)                   # (ntr, nt)
-        data = data.rechunk((1, npts))  
+        data = da.stack(darr_list, axis=0)
+        trc = self.chunks_tr
+        tc = self.chunks_t or int(self.chunk_size_s * self.samp_rate)                  # (ntr, nt)
+        data = data.rechunk((trc, tc))  
 
         # -------------   NEW:  make the final chunking *right here*   ‑----------
         # chunks_t = int(self.chunk_size_s * self.samp_rate)   # 1200 s  → 24 000 samples
@@ -301,68 +325,104 @@ class SeismicBeamformer:
         """
         X = np.fft.rfft(arr * win[None,:], axis=1)    # (ntr,nf)
         R = np.einsum("if,jf->fij", X, X.conj())      # (nf,ntr,ntr)
-        return R
+        return R.astype(np.complex64)
 
-    def compute_csd_dask(self,
-                        raw_zarr: str = None,
-                        spill_zarr: str = None
-                        ) -> tuple[da.Array, np.ndarray]:
+    @staticmethod
+    def _csd_chunk(arr, win, *, block_info=None):
+        X = np.fft.rfft(arr * win[None, :], axis=1)
+        return np.einsum("if,jf->fij", X, X.conj()).astype(np.complex64)
+
+    def compute_csd_dask(
+            self,
+            raw_zarr:   str  = None,
+            spill_zarr: str  = None,
+            freq_chunk: int  = 8,
+    ):
         """
-        1) open raw Zarr
-        2) extract sliding‐windows & do map_blocks
-        3) sum & normalize → self.Rf, self.freqs
-        4) optionally spill R(f,i,j) to Zarr
+        Compute the daily CSD cube R(f,i,j) with < 5 GB peak RAM
+        and a few-thousand-task Dask graph.
+
+        Steps
+        -----
+        1.  open raw Zarr lazily
+        2.  rechunk once:         • ONE chunk on the trace axis
+                                • hop-sized chunks (800 samples) on time
+        3.  for every sliding window
+            – slice (touches ≤ 2 tiny time chunks)
+            – fuse them to one (ntr , wlen) block (cheap copy)
+            – map_blocks → CSD, emitted already with
+                (freq_chunk , ntr , ntr) chunking
+        4.  binary tree reduction of all windows
+        5.  pull the final ~90 MB cube to the driver and let xarray
+            write it directly to Zarr (no large worker tasks)
         """
+
+        # ---------- helper -------------------------------------------------
+        def _chunks_tuple(axis_len: int, c: int):
+            """Return a tuple like (c, c, …, remainder) whose sum == axis_len."""
+            q, r = divmod(axis_len, c)
+            return (c,) * q + ((r,) if r else ())
+
+        # ---------- locate the raw store -----------------------------------
         raw_zarr = raw_zarr or self.raw_zarr
         if not raw_zarr:
-            raise ValueError("must provide raw_zarr in load_data or here")
+            raise ValueError("raw_zarr must be given")
 
         logging.info(f"Opening raw timeseries from {raw_zarr}")
-        ds_z = xr.open_zarr(raw_zarr, consolidated=True)
-        raw  = ds_z.u.data                     # (ntr, nt)
-        ntr, nt = raw.shape
+        raw = xr.open_zarr(raw_zarr, consolidated=True).u.data   # <-- lazy Dask
 
-        # FFT params
+        # ---------- window / FFT constants ---------------------------------
         i0, i1 = self.win_idx[0]
-        wlen    = i1 - i0
-        dt      = float(self.ds.time.values[1]
-                        - self.ds.time.values[0])
-        Fs      = 1.0 / dt
-        freqs   = np.fft.rfftfreq(wlen, dt)
-        win     = get_window("hann", wlen)
-        U       = np.sum(win * win)
+        wlen   = i1 - i0                    # 1 000 samples
+        step   = (self.win_idx[1][0] - i0) if len(self.win_idx) > 1 else wlen
+                                            # 800 samples
+        dt     = float(self.ds.time.values[1] - self.ds.time.values[0])
+        Fs     = 1.0 / dt
+        freqs  = np.fft.rfftfreq(wlen, dt)
+        nfreq  = freqs.size
+        win    = get_window("hann", wlen)
+        U      = np.sum(win * win)
 
-        logging.info("Computing CSD for each window…")
-        R_blocks = []
-        for (i0, i1) in self.win_idx:
-            slice_ = raw[:, i0:i1]
-            slice_ = slice_.rechunk({0: ntr, 1: wlen})
-            Rb = da.map_blocks(
-                SeismicBeamformer._csd_block_dask,
-                slice_,    # (ntr, wlen)
-                win,
-                dtype=np.complex128,
-                chunks=(freqs.size, ntr, ntr)
-            )
-            R_blocks.append(Rb)
-        R_all = da.stack(R_blocks, axis=0)       # (nwin,nf,ntr,ntr)
-        R_sum = (R_all.sum(axis=0)            # (nf,ntr,ntr)
-                 / (len(self.win_idx) * Fs * U))
+        # ---------- ONE rechunk of the raw array ---------------------------
+        raw = raw.rechunk({0: -1, 1: step})      # one trace chunk, hop chunks
+        ntr = raw.shape[0]                       # e.g. 150 traces
 
+        # sliding-window view on the time axis ------------------------------
+        def one_window(i0, i1):
+            slc = raw[:, i0:i1].rechunk({1: wlen})
+            return da.map_blocks(self._csd_chunk, slc, win,
+                                chunks=((nfreq,), (ntr,), (ntr,)),
+                                dtype=np.complex64)
+
+        windows = [one_window(i0, i1) for (i0, i1) in self.win_idx]
+        R_stack = da.stack(windows, axis=0)          # (nwin, nfreq, ntr, ntr)
+
+        R_sum = R_stack.sum(axis=0, split_every=2) / (len(self.win_idx) * Fs * U)
+
+        # optional: break the 501 freqs into 8-wide pieces (cheap)
+        R_sum = R_sum.rechunk((freq_chunk, ntr, ntr))
+
+        # ---------- stash on the object ------------------------------------
         self.freqs = freqs
-        self.Rf     = R_sum
+        self.Rf    = R_sum                     # lazy Dask array (8-bin chunks)
 
+        # ---------- optionally write to Zarr  ------------------------------
         if spill_zarr:
-            logging.info(f"Spilling CSD to {spill_zarr}")
-            xr.DataArray(R_sum,
-                         dims=("freq","tr","tr2"),
-                         coords={"freq": freqs,
-                                 "tr":   self.ds.tr,
-                                 "tr2":  self.ds.tr}
-            ).to_dataset(name="Rf") \
-             .to_zarr(spill_zarr, mode="w")
-        return R_sum, freqs
+            logging.info("Computing final CSD cube (~90 MB)…")
+            R_np = R_sum.compute()             # NumPy array on the driver
 
+            logging.info(f"Writing CSD to {spill_zarr}")
+            xr.DataArray(
+                R_np,
+                dims   = ("freq", "tr", "tr2"),
+                coords = {"freq": freqs,
+                        "tr":   self.ds.tr,
+                        "tr2":  self.ds.tr},
+            ).to_dataset(name="Rf").to_zarr(
+                spill_zarr, mode="w", consolidated=True)
+
+        return R_sum, freqs
+                     
     @staticmethod
     def _beamform_bartlett_vec(Rsub: np.ndarray,
                                freqs: np.ndarray,

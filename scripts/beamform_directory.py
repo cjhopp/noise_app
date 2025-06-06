@@ -28,6 +28,10 @@ WIN_S       = 50.0      # window length for CSD
 OVERLAP     = 0.2
 PAD_S       = 10.0
 
+# ─── NEW: how we want the raw-Zarr to be chunked ───────────────
+TRS_PER_CHK = 30                       # traces per chunk  (≈10 stations)
+CHUNKS_T    = int(CHUNK_S * SAMP_RATE) # 1 200 s × 20 Hz → 24 000 samples
+
 BAZS  = np.arange(0,360,5.0)
 SLOWS = np.linspace(0.0,0.003,30)
 BANDS = [(0.1,1.0),(1.0,5.0),(5.0,10.0)]
@@ -35,6 +39,9 @@ BANDS = [(0.1,1.0),(1.0,5.0),(5.0,10.0)]
 # how large to make each raw‐Zarr time chunk?
 WRITE_CHUNK_S = 86400                  # 10 minutes
 WRITE_CHUNK_N = int(WRITE_CHUNK_S * SAMP_RATE)
+
+DASK_TMP = "/media/chopp/Data1/dask-spill"       # put it on a big disk
+os.makedirs(DASK_TMP, exist_ok=True)
 
 # ─── add somewhere near the top of the driver script ───────────────────
 
@@ -62,17 +69,11 @@ def raw_store_complete(path: str,
     if tuple(ds.u.shape) != (expected_ntr, expected_npts):
         return False
 
-    # ---- chunking along 'tr' ------------------------------------------
     tr_chunks, t_chunks = ds.u.chunks
-    if any(c != 1 for c in tr_chunks):
-        return False
     if sum(tr_chunks) != expected_ntr:
         return False
-
-    # ---- chunking along 'time' ----------------------------------------
     if sum(t_chunks) != expected_npts:
         return False
-
     return True
 
 #––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
@@ -129,13 +130,15 @@ def stage1_write_raw(inv, blocks):
 
         print(f"Writing {raw_z} …")
         bf = SeismicBeamformer(
-                 mseed_dir=MSEED_DIR, inventory=inv,
-                 t0=t0, t1=t1,
-                 samp_rate=SAMP_RATE,
-                 chunk_size_s=CHUNK_S
+                mseed_dir=MSEED_DIR, inventory=inv,
+                t0=t0, t1=t1,
+                samp_rate=SAMP_RATE,
+                chunk_size_s=CHUNK_S,
+                chunks_tr=TRS_PER_CHK,
+                chunks_t=CHUNKS_T,
              )
         ds  = bf.load_data()
-        ds2 = ds.chunk({"tr": 1, "time": expected_npts})
+        ds2 = ds.chunk({"tr": TRS_PER_CHK, "time": CHUNKS_T})
 
         write = ds2.to_zarr(raw_z,
                             mode="w",
@@ -155,12 +158,15 @@ def stage1_write_raw(inv, blocks):
 #––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 def stage2_compute_csd(inv, blocks):
     cluster = LocalCluster(
-        n_workers=5,
-        threads_per_worker=1,
-        memory_limit="12GB",
-        resources={"csd": 1}
+        n_workers         = 5,
+        threads_per_worker= 1,
+        memory_limit      = "12GB",
+        local_directory   = DASK_TMP,   ### ←  NEW  ###
+        resources         = {"csd-window": 1},
     )
     client = Client(cluster)
+
+    chunks_t = int(CHUNK_S * SAMP_RATE)      # 1200 s × 20 Hz = 24000
 
     for (t0, t1) in blocks:
         tag   = f"{t0.year}_{t0.julday:03d}"
@@ -173,16 +179,20 @@ def stage2_compute_csd(inv, blocks):
             inventory=inv,
             t0=t0, t1=t1,
             samp_rate=SAMP_RATE,
-            chunk_size_s=CHUNK_S
+            chunk_size_s=CHUNK_S,
+            chunks_tr=TRS_PER_CHK,
+            chunks_t=CHUNKS_T,
         )
         bf.raw_zarr = raw_z
 
         # open + rechunk one station at a time
         ds_raw    = xr.open_zarr(raw_z, consolidated=True)
-        bf.ds     = ds_raw.chunk({"tr": 1, "time": WRITE_CHUNK_N})
+        # ds_raw     = ds_raw.chunk({"tr": 1, "time": chunks_t})
+
+        bf.ds = ds_raw
 
         bf.preprocess(
-            band=(0.1,10.0),
+            band=(0.1,9.0),
             window_s=WIN_S,
             overlap=OVERLAP,
             pad_s=PAD_S
@@ -278,7 +288,7 @@ def main():
     inv    = read_inventory(INVENTORY_XML).select(station="G*")
     blocks = make_daily_blocks(RUN_START, RUN_END)
 
-    stage1_write_raw(inv,    blocks)
+    # stage1_write_raw(inv,    blocks)
     stage2_compute_csd(inv, blocks)
     stage3_beam(inv,        blocks)
 
